@@ -7,12 +7,16 @@
 #
 # 设计成薄壳:它不替你做智能(智能在模型那)。它只干三件事:
 #   1. 取出某个事件的完整原始过程(默认用 defanged 副本,绝不把活 key 喂给外部模型)
-#   2. 把"那段过程被压成可读对话 + 你的新任务"拼成一份上下文
+#   2. 把那段过程压成可读对话、并压到能塞进上下文窗口,拼上你的新任务
 #   3. 打到 stdout(管道给任意 agent),或 --run 直接起一个本机 claude 会话
 #
+# 关于"压到窗口内":一个真实长会话整段倒入会超过百万窗口(实测一个 48h 事件 ~104万 token)。
+# 所以激活时必须做有损压缩——这是物理逼出来的、最原始的"图书管理员"。冷层原件永远不动。
+#
 # 用法:
-#   ./tools/use <事件目录> "<新任务>"          组装上下文 -> stdout(管道给任何 agent/API)
-#   ./tools/use <事件目录> "<新任务>" --run     若本机有 claude CLI,直接起一个带经验的会话
+#   ./tools/use <事件目录> "<新任务>"                组装上下文 -> stdout
+#   ./tools/use <事件目录> "<新任务>" --run           若本机有 claude CLI,直接起会话
+#   ./tools/use <事件目录> "<新任务>" --budget 900000  自定义字符预算(默认 1_000_000)
 
 import sys
 import os
@@ -20,48 +24,48 @@ import json
 import shutil
 import subprocess
 
-TRUNCATE_TOOL_OUTPUT = 800   # 工具输出(文件内容/命令回显)很占 token,渲染时截断
-SIZE_WARN_TOKENS = 700_000   # 经验值:超过这个量级,单次喂入接近百万窗口上限
+# 默认字符预算。中文约 0.4~0.5 token/字节,1.0M 字节约 ~450k token,
+# 给 claude 自身的 system prompt + 工具定义留足头部空间(它们也吃几十万 token)。
+DEFAULT_BUDGET_BYTES = 1_000_000
 
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
 
-if len(sys.argv) < 3:
-    die('用法: ./tools/use <事件目录> "<新任务>" [--run]')
-
-event_dir = sys.argv[1]
-task = sys.argv[2]
-run = "--run" in sys.argv[3:]
+argv = sys.argv[1:]
+run = "--run" in argv
+budget = DEFAULT_BUDGET_BYTES
+if "--budget" in argv:
+    i = argv.index("--budget")
+    budget = int(argv[i + 1])
+    del argv[i:i + 2]
+argv = [a for a in argv if a != "--run"]
+if len(argv) < 2:
+    die('用法: ./tools/use <事件目录> "<新任务>" [--run] [--budget N]')
+event_dir, task = argv[0], argv[1]
 
 if not os.path.isdir(event_dir):
     die(f"找不到事件目录: {event_dir}")
 
 # 安全优先:有 defanged 副本就用它,绝不喂原件给外部模型。
-candidates = [
-    "transcript.defanged.jsonl",
-    "transcript.jsonl",
-    "raw.txt",
-]
+candidates = ["transcript.defanged.jsonl", "transcript.jsonl", "raw.txt"]
 src = None
 used_raw_original = False
 for name in candidates:
     p = os.path.join(event_dir, name)
     if os.path.exists(p):
         src = p
-        if name == "transcript.jsonl":
-            used_raw_original = True
+        used_raw_original = (name == "transcript.jsonl")
         break
 if src is None:
     die(f"事件目录里没有可用的过程文件(找了 {candidates})")
-
 if used_raw_original:
-    print("警告: 只找到未脱敏原件 transcript.jsonl。--run 给外部模型前,先跑 ./tools/defang 生成 defanged 副本,"
-          "否则可能把活密钥送出门。", file=sys.stderr)
+    print("警告: 只找到未脱敏原件。--run 给外部模型前先跑 ./tools/defang,否则可能把活密钥送出门。", file=sys.stderr)
 
-def render_jsonl(path):
-    """把 Claude Code 的 transcript JSONL 压成可读对话:保留发言与决策,截断臃肿的工具输出。"""
-    lines_out = []
+def render_jsonl(path, tool_trunc, drop_results, drop_tooluse):
+    """把 Claude Code transcript JSONL 压成可读对话。
+    tool_trunc: 工具输入/输出截断字符数; drop_results: 丢掉工具结果; drop_tooluse: 工具调用只留名字。"""
+    out = []
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for raw in f:
             raw = raw.strip()
@@ -77,31 +81,59 @@ def render_jsonl(path):
             if content is None:
                 continue
             if isinstance(content, str):
-                lines_out.append(f"[{role}] {content}")
+                out.append(f"[{role}] {content}")
                 continue
             for item in content:
                 if not isinstance(item, dict):
                     continue
                 t = item.get("type")
                 if t == "text":
-                    lines_out.append(f"[{role}] {item.get('text','')}")
+                    out.append(f"[{role}] {item.get('text','')}")
                 elif t == "tool_use":
-                    inp = json.dumps(item.get("input", {}), ensure_ascii=False)
-                    if len(inp) > TRUNCATE_TOOL_OUTPUT:
-                        inp = inp[:TRUNCATE_TOOL_OUTPUT] + " …(截断)"
-                    lines_out.append(f"[{role} 调用工具 {item.get('name','')}] {inp}")
+                    if drop_tooluse:
+                        out.append(f"[{role} 调用工具 {item.get('name','')}]")
+                    else:
+                        inp = json.dumps(item.get("input", {}), ensure_ascii=False)
+                        if len(inp) > tool_trunc:
+                            inp = inp[:tool_trunc] + " …(截断)"
+                        out.append(f"[{role} 调用工具 {item.get('name','')}] {inp}")
                 elif t == "tool_result":
+                    if drop_results:
+                        continue
                     c = item.get("content", "")
                     if isinstance(c, list):
                         c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
                     c = str(c)
-                    if len(c) > TRUNCATE_TOOL_OUTPUT:
-                        c = c[:TRUNCATE_TOOL_OUTPUT] + " …(截断)"
-                    lines_out.append(f"[工具结果] {c}")
-    return "\n".join(lines_out)
+                    if len(c) > tool_trunc:
+                        c = c[:tool_trunc] + " …(截断)"
+                    out.append(f"[工具结果] {c}")
+    return "\n".join(out)
+
+# 逐级压缩,直到塞进预算。L0 最完整,逐级砍工具噪声,文本发言永远保留。
+levels = [
+    ("L0 完整",            dict(tool_trunc=800, drop_results=False, drop_tooluse=False)),
+    ("L1 工具输出收紧",     dict(tool_trunc=300, drop_results=False, drop_tooluse=False)),
+    ("L2 丢工具结果",       dict(tool_trunc=150, drop_results=True,  drop_tooluse=False)),
+    ("L3 只留发言与决策",   dict(tool_trunc=0,   drop_results=True,  drop_tooluse=True)),
+]
 
 if src.endswith(".jsonl"):
-    body = render_jsonl(src)
+    body = None
+    chosen = None
+    for label, kw in levels:
+        candidate = render_jsonl(src, **kw)
+        if len(candidate.encode("utf-8")) <= budget:
+            body, chosen = candidate, label
+            break
+    if body is None:
+        # 连 L3 都超预算:硬截尾,保留最近的部分(经验的尾段通常最接近"成品")。
+        full = render_jsonl(src, **levels[-1][1])
+        b = full.encode("utf-8")[-budget:]
+        body = b.decode("utf-8", errors="ignore")
+        chosen = "L3+尾部硬截断"
+    print(f"压缩级别: {chosen} ; body={len(body.encode('utf-8')):,} 字节 (预算 {budget:,})", file=sys.stderr)
+    if chosen != "L0 完整":
+        print("注意: 已做有损压缩才塞进窗口——这正是激活路径上绕不开的'选择'。冷层原件未动。", file=sys.stderr)
 else:
     with open(src, "r", encoding="utf-8", errors="replace") as f:
         body = f.read()
@@ -119,16 +151,9 @@ prompt = f"""下面是一次过去的完整工作过程的记录。它解决过�
 {task}
 """
 
-# 体积诚实提示:这正是"喂整段"这条路的墙。撞墙了,说明你需要的是"选哪段"(未来的图书管理员),不是更大的窗口。
-approx_tokens = len(prompt) // 4
-if approx_tokens > SIZE_WARN_TOKENS:
-    print(f"警告: 组装出的上下文约 {approx_tokens:,} tokens,接近/超过单次窗口上限。"
-          f"这是 dump-whole 的墙——n 变大时你需要的是'选哪段倒进去',而不是硬塞。", file=sys.stderr)
-
 if run:
     if not shutil.which("claude"):
         die("本机没有 claude CLI。去掉 --run 可把上下文打到 stdout,自己管道给任意 agent/API。")
-    # 薄壳:把组装好的上下文交给 claude headless 跑。
-    subprocess.run(["claude", "-p", prompt])
+    subprocess.run(["claude", "-p"], input=prompt, text=True)
 else:
     sys.stdout.write(prompt)
