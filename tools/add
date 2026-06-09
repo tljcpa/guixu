@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# 归墟 add —— 把一次 session 以最低摩擦丢进 raw/。
+#
+# 设计目标只有一个:让"往归墟丢东西"的成本接近于零。
+# 这类个人留存系统的头号死因是每次录入摩擦太大,所以这条命令必须够笨够快。
+#
+# 用法:
+#   ./tools/add <label>                  建一个空事件目录,打印路径(你再往里拖文件)
+#   cat 对话.txt | ./tools/add <label>    直接把 stdin 存成 raw.txt
+#   pbpaste   | ./tools/add <label>       (Win/WSL: powershell Get-Clipboard | ...)
+#
+# 注意:raw 是神圣的——这条命令只"原样存",绝不就地改、绝不脱敏。
+#       脱敏是把某个事件"提升为公开样例"时才做的事(见 tools/scrub)。
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+label="${1:-session}"
+
+# 时间戳作为事件目录前缀。物理单元 = 一次坐下来干活,机械规则,零判断。
+stamp="$(date +%Y-%m-%d-%H%M%S)"
+# 把 label 里的空格/斜杠换成连字符,避免建出奇怪路径
+safe_label="$(echo "$label" | tr ' /' '--')"
+dir="$ROOT/raw/${stamp}-${safe_label}"
+mkdir -p "$dir"
+
+# 如果有 stdin 管道进来(不是终端),就把它原样存成 raw.txt
+if [ ! -t 0 ]; then
+  cat > "$dir/raw.txt"
+  bytes="$(wc -c < "$dir/raw.txt")"
+  echo "已原样存入 stdin -> $dir/raw.txt (${bytes} bytes)"
+fi
+
+# 留一个空的 NOTE,鼓励但不强制你回头补三行"这是什么事/结果/未来想回看什么"
+# 这三行将来就是热层 index 的雏形。现在不写也没关系。
+if [ ! -f "$dir/NOTE.md" ]; then
+  {
+    echo "# 这是什么事:"
+    echo "# 结果:"
+    echo "# 未来可能想回看:"
+  } > "$dir/NOTE.md"
+fi
+
+echo "$dir"

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# 归墟 scrub —— 把某个事件提升为"公开样例"前的脱敏关卡。
+#
+# 为什么不在 add 时自动脱敏:raw 是神圣的,就地改原始记录违背根(永不就地压缩)。
+# 所以脱敏只在"要把一个私有事件做成公开 example"这一刻发生,且产出的是副本,不动原件。
+#
+# 用法:
+#   ./tools/scrub <事件目录>            只扫描并报告疑似敏感命中(不改任何东西)
+#   ./tools/scrub <事件目录> --redact   额外产出一份打码副本到 examples/<名字>/
+#
+# 它不是万能的。脱敏的最终责任在人——这条命令只负责"别让你漏掉明显的"。
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+target="${1:-}"
+mode="${2:-scan}"
+
+if [ -z "$target" ] || [ ! -d "$target" ]; then
+  echo "用法: ./tools/scrub <事件目录> [--redact]" >&2
+  exit 1
+fi
+
+# 疑似敏感模式。宁可多报(误报)也不能漏报——和 vault 的"冗余<错误<丢失"同构。
+patterns=(
+  'ghp_[A-Za-z0-9]{20,}'                 # GitHub PAT
+  'sk-[A-Za-z0-9]{20,}'                  # OpenAI 风格 key
+  'AKIA[0-9A-Z]{16}'                     # AWS access key
+  'eyJ[A-Za-z0-9_-]{10,}\.'              # JWT
+  '-----BEGIN [A-Z ]*PRIVATE KEY-----'   # 私钥
+  '(password|passwd|pwd|secret|token|api[_-]?key)["'\'' :=]+[^ "'\'']{6,}'
+  '[0-9]{1,3}(\.[0-9]{1,3}){3}'          # IP 地址(含内网)
+  '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' # 邮箱
+)
+
+echo "扫描 $target ..."
+hit=0
+for p in "${patterns[@]}"; do
+  # -r 递归,-n 行号,-E 扩展正则,-I 跳过二进制
+  if grep -rnEI "$p" "$target" 2>/dev/null; then
+    hit=1
+  fi
+done
+
+if [ "$hit" -eq 0 ]; then
+  echo "未发现明显敏感命中。但人仍需自己再看一遍。"
+else
+  echo "---"
+  echo "发现疑似敏感内容(见上)。提升为公开样例前必须处理。"
+fi
+
+if [ "$mode" = "--redact" ]; then
+  name="$(basename "$target")"
+  out="$ROOT/examples/$name"
+  mkdir -p "$out"
+  cp -r "$target/." "$out/"
+  for p in "${patterns[@]}"; do
+    grep -rlEI "$p" "$out" 2>/dev/null | while read -r f; do
+      # 就地把命中替换成 [REDACTED]。注意:改的是 examples/ 副本,不是 raw 原件。
+      sed -i -E "s/$p/[REDACTED]/g" "$f"
+    done
+  done
+  echo "已生成打码副本 -> $out (仍需人工复核后才能提交)"
+fi
