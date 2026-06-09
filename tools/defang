@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# 归墟 defang —— scrub 的第 1 层:确定性预洗,专杀"已知形状"的活密钥。
+#
+# 它的唯一职责:在任何模型/任何人读到原文之前,先把高危、不会误判的凭证形状
+# 替换成带类型的占位符。便宜、可复现、永远先跑。
+#
+# 它故意只管"形状极明确、几乎不可能误伤"的东西(PAT/sk-/AWS/JWT/私钥块)。
+# 上下文敏感的内网名、人名、那种"长得像但不确定"的串,留给第 2 层(LLM 语义扫)。
+#
+# 铁律:绝不就地改原件。读 in,写一份新的 out。脚本里绝不硬编码任何真实密钥。
+#
+# 用法:  ./tools/defang <输入文件> <输出文件>
+
+import sys
+import re
+
+if len(sys.argv) != 3:
+    print("用法: ./tools/defang <输入文件> <输出文件>", file=sys.stderr)
+    sys.exit(1)
+
+src = sys.argv[1]
+dst = sys.argv[2]
+
+# 每条规则: (名字, 编译后的正则, 占位符)。只放形状明确、误判率极低的。
+rules = [
+    ("GITHUB_PAT_FINE", re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "[REDACTED_GITHUB_PAT]"),
+    ("GITHUB_PAT",      re.compile(r"ghp_[A-Za-z0-9]{20,}"),          "[REDACTED_GITHUB_PAT]"),
+    ("GITHUB_OTHER",    re.compile(r"gh[opsu]_[A-Za-z0-9]{20,}"),     "[REDACTED_GITHUB_TOKEN]"),
+    ("OPENAI_KEY",      re.compile(r"sk-[A-Za-z0-9_-]{20,}"),         "[REDACTED_API_KEY]"),
+    ("AWS_AKID",        re.compile(r"AKIA[0-9A-Z]{16}"),              "[REDACTED_AWS_KEY]"),
+    ("GOOGLE_KEY",      re.compile(r"AIza[0-9A-Za-z_-]{30,}"),        "[REDACTED_GOOGLE_KEY]"),
+    ("SLACK_TOKEN",     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),  "[REDACTED_SLACK_TOKEN]"),
+    # JWT: 完整三段式,避免误伤普通 base64
+    ("JWT",             re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}"), "[REDACTED_JWT]"),
+    # 私钥块(JSONL 里换行被转义成 \n,所以按单行非贪婪匹配)
+    ("PRIVATE_KEY",     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+]
+
+counts = {name: 0 for name, _, _ in rules}
+
+with open(src, "r", encoding="utf-8", errors="replace") as fin, \
+     open(dst, "w", encoding="utf-8") as fout:
+    for line in fin:
+        for name, rx, placeholder in rules:
+            line, n = rx.subn(placeholder, line)
+            counts[name] += n
+        fout.write(line)
+
+print("=== defang 完成,原件未动 ===")
+total = 0
+for name, _, _ in rules:
+    if counts[name] > 0:
+        print(f"  {name:18s} 替换 {counts[name]} 处")
+        total += counts[name]
+print(f"  共 {total} 处高危凭证已替换为带类型占位符")
+print(f"  输出: {dst}")
+print("注意: 这只杀了已知形状。上下文敏感的(内网名/人名/未知格式 key)仍需第 2 层 LLM 扫。")
